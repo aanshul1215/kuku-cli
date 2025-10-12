@@ -1,4 +1,4 @@
-# kuku_cli/app/main.py
+﻿# kuku_cli/app/main.py
 """
 Kuku CLI - Application shell (menu loop)
 
@@ -364,3 +364,4 @@ def run() -> None:
         except ValueError:
             ui.warn("Enter a numeric value where expected.")
             ui.pause()
+            
