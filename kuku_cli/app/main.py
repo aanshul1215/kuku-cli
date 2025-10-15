@@ -2,13 +2,11 @@
 """
 Kuku CLI - Application shell (menu loop)
 
-Guided order entry:
+Guided order entry uses *fixed market prices*:
   - user picks tickers (comma separated)
   - app asks quantity for each ticker
-  - app asks price for each ticker
+  - app looks up price from market for each ticker
 Then we show a summary table and update portfolio + balance.
-
-No 'justify=' kwargs are used when printing tables.
 """
 
 from typing import Dict, Tuple, List
@@ -21,22 +19,18 @@ from kuku_cli.infra.repo import UsersRepo, PortfoliosRepo
 from kuku_cli.services.auth import AuthService
 from kuku_cli.services.users import UsersService
 from kuku_cli.services.portfolios import PortfolioService
-from kuku_cli.data.market import SECURITIES
+from kuku_cli.data import market  # fixed-price source of truth
 
 
 # --------------------------- helpers ----------------------------------------
 
-
 def _seed_admin_once(users: UsersService) -> None:
-    """Create a default admin user if missing."""
     names = [u.username for u in users.list()]
     if "admin" not in names:
         users.create("admin", "adminpass", "Kuku", "Admin", balance=5000.0, is_admin=True)
 
-
 def _money(x: float) -> str:
     return f"{x:,.2f}"
-
 
 def _ask_float(ui: ConsoleUI, label: str) -> float:
     while True:
@@ -50,9 +44,7 @@ def _ask_float(ui: ConsoleUI, label: str) -> float:
         except ValueError:
             ui.warn("Enter a numeric value.")
 
-
 def _parse_tickers(ui: ConsoleUI, *, require_known: bool) -> List[str]:
-    """Ask for comma-separated tickers and validate/normalize them."""
     raw = ui.ask("Securities to add (comma-separated), e.g. AAPL, MSFT").strip()
     out: List[str] = []
     seen = set()
@@ -60,7 +52,7 @@ def _parse_tickers(ui: ConsoleUI, *, require_known: bool) -> List[str]:
         t = part.strip().upper()
         if not t:
             continue
-        if require_known and t not in SECURITIES:
+        if require_known and market.get_security(t) is None:
             ui.warn(f"Unknown ticker: {t}")
             raise ValueError(f"Unknown ticker: {t}")
         if t not in seen:
@@ -70,25 +62,25 @@ def _parse_tickers(ui: ConsoleUI, *, require_known: bool) -> List[str]:
         raise ValueError("No tickers provided.")
     return out
 
-
 def _collect_orders_guided(
     ui: ConsoleUI,
     *,
     require_known_tickers: bool,
     qty_label_tmpl: str,
-    price_label_tmpl: str,
 ) -> Tuple[Dict[str, Tuple[float, float]], float]:
     """
-    Guided buy/sell entry:
-      1) optionally show marketplace
+    Guided buy/sell entry (fixed-price):
+      1) show marketplace (optional)
       2) ask tickers (comma-separated)
       3) ask qty per ticker
-      4) ask price per ticker
+      4) compute price from market
     Returns: (orders_map, total_cost_or_proceeds)
-             where orders_map = { ticker: (qty, price) }
+             where orders_map = { ticker: (qty, fixed_price) }
     """
     if require_known_tickers:
-        ui.table("Marketplace", ["Ticker", "Name"], SECURITIES.items())
+        secs = market.list_securities()
+        rows = [(s.ticker, s.name, f"{s.price:,.2f}") for s in secs]
+        ui.table("Marketplace", ["Ticker", "Name", "Price"], rows)
 
     tickers = _parse_tickers(ui, require_known=require_known_tickers)
 
@@ -96,29 +88,22 @@ def _collect_orders_guided(
     for t in tickers:
         qty_map[t] = _ask_float(ui, qty_label_tmpl.format(ticker=t))
 
-    price_map: Dict[str, float] = {}
-    for t in tickers:
-        price_map[t] = _ask_float(ui, price_label_tmpl.format(ticker=t))
-
     orders: Dict[str, Tuple[float, float]] = {}
     total = 0.0
     for t in tickers:
         q = qty_map[t]
-        p = price_map[t]
+        p = market.get_price(t)  # fixed price
         orders[t] = (q, p)
         total += q * p
 
-    return orders, total
-
+    return orders, round(total, 2)
 
 # --------------------------- app entry --------------------------------------
-
 
 def run() -> None:
     ui = ConsoleUI()
 
-    # Infrastructure wiring
-    store = Store(path="data/state.pkl")      # persisted to disk
+    store = Store(path="data/state.pkl")
     users_repo = UsersRepo(store)
     ports_repo = PortfoliosRepo(store)
 
@@ -197,7 +182,7 @@ def run() -> None:
                 ui.palette("Manage users", menus.ADMIN)
 
                 choice = ui.ask("> ").strip()
-                if choice == "1":  # view users
+                if choice == "1":
                     hdrs = ["Username", "Name", "Admin", "Balance"]
                     rows = [
                         (u.username, f"{u.first_name} {u.last_name}", "yes" if u.is_admin else "no", _money(u.balance))
@@ -206,7 +191,7 @@ def run() -> None:
                     ui.table("Users", hdrs, rows)
                     ui.pause()
 
-                elif choice == "2":  # create user
+                elif choice == "2":
                     un = ui.ask("Username")
                     pw = ui.ask_password("Password")
                     fn = ui.ask("First name")
@@ -216,7 +201,7 @@ def run() -> None:
                     users.create(un, pw, fn, ln, bal, is_admin=adm)
                     ui.ok("User created.")
 
-                elif choice == "3":  # delete user
+                elif choice == "3":
                     un = ui.ask("Username to delete")
                     users.delete(un)
                     ui.ok("User deleted.")
@@ -251,7 +236,7 @@ def run() -> None:
                 ui.palette("Options", menus.PORTFOLIOS)
 
                 choice = ui.ask("> ").strip()
-                if choice == "1":  # view portfolios with live holdings
+                if choice == "1":
                     ps = list(ports.list_for(u.username))
                     hdrs = ["Name", "Strategy", "Holdings", "ID"]
                     rows = []
@@ -274,7 +259,6 @@ def run() -> None:
                                 ui,
                                 require_known_tickers=True,
                                 qty_label_tmpl="Quantity for {ticker}",
-                                price_label_tmpl="Purchase price for {ticker}",
                             )
                         except ValueError as ve:
                             ui.warn(str(ve))
@@ -282,38 +266,33 @@ def run() -> None:
                         else:
                             new_balance = ports.buy(p.id, u.username, orders, total, lambda: u.balance)
                             u.balance = new_balance
-                            users_repo.upsert(u)  # persist
+                            users_repo.upsert(u)
 
                             hdrs = ["Ticker", "Qty", "Price", "Cost"]
                             rows = [(t, q, pr, q * pr) for t, (q, pr) in orders.items()]
                             ui.table("Initial Purchase Allocation", hdrs, rows)
                             ui.ok(f"Total spent: ${_money(total)}. New balance: ${_money(u.balance)}")
 
-                elif choice == "3":  # delete
+                elif choice == "3":
                     pid = ui.ask("Portfolio ID")
                     ports.delete(pid)
                     ui.ok("Portfolio deleted.")
 
-                elif choice == "4":  # sell / liquidate
+                elif choice == "4":  # sell / liquidate (fixed price)
                     pid = ui.ask("Portfolio ID")
                     try:
-                        orders, _ = _collect_orders_guided(
-                            ui,
-                            require_known_tickers=False,
-                            qty_label_tmpl="Quantity to sell for {ticker}",
-                            price_label_tmpl="Sale price for {ticker}",
-                        )
+                        orders, _ = _collect_orders_guided_sell(ui, require_known_tickers=False, qty_label_tmpl="Quantity to sell for {ticker}", price_label_tmpl="Sale price for {ticker}")
                     except ValueError as ve:
                         ui.warn(str(ve))
                         ui.pause()
                     else:
-                        proceeds = ports.sell(pid, u.username, orders)
-                        u.balance += proceeds
+                        got = ports.sell(pid, u.username, orders)
+                        u.balance += got
                         users_repo.upsert(u)
                         hdrs = ["Ticker", "Qty", "Price", "Proceeds"]
                         rows = [(t, q, pr, q * pr) for t, (q, pr) in orders.items()]
                         ui.table("Sale Summary", hdrs, rows)
-                        ui.ok(f"Proceeds: ${_money(proceeds)}. New balance: ${_money(u.balance)}")
+                        ui.ok(f"Proceeds: ${_money(got)}. New balance: ${_money(u.balance)}")
 
                 elif choice == "9":
                     current = menus.USER_MENU
@@ -327,8 +306,10 @@ def run() -> None:
                 ui.palette("Options", menus.MARKET)
 
                 choice = ui.ask("> ").strip()
-                if choice == "1":  # view securities
-                    ui.table("Securities", ["Ticker", "Name"], SECURITIES.items())
+                if choice == "1":  # view securities with fixed prices
+                    secs = market.list_securities()
+                    rows = [(s.ticker, s.name, f"{s.price:,.2f}") for s in secs]
+                    ui.table("Securities", ["Ticker", "Name", "Price"], rows)
                     ui.pause()
 
                 elif choice == "2":  # buy (guided) into an existing portfolio
@@ -338,7 +319,6 @@ def run() -> None:
                             ui,
                             require_known_tickers=True,
                             qty_label_tmpl="Quantity for {ticker}",
-                            price_label_tmpl="Purchase price for {ticker}",
                         )
                     except ValueError as ve:
                         ui.warn(str(ve))
@@ -357,11 +337,132 @@ def run() -> None:
                 else:
                     ui.warn("Unknown option.")
 
-        # ---- friendly error handling ---------------------------------------
         except (DomainError, AuthError, NotFound) as e:
             ui.error(str(e))
             ui.pause()
         except ValueError:
             ui.warn("Enter a numeric value where expected.")
             ui.pause()
-            
+
+
+def _collect_orders_guided_sell(
+    ui: ConsoleUI,
+    *,
+    require_known_tickers: bool,
+    qty_label_tmpl: str,
+    price_label_tmpl: str,
+) -> Tuple[Dict[str, Tuple[float, float]], float]:
+    """
+    SELL order entry (user-provided sale price):
+      1) optionally show marketplace
+      2) ask tickers (comma-separated)
+      3) ask qty per ticker
+      4) ask sale price per ticker
+    Returns: (orders_map, total_proceeds_preview)
+             where orders_map = { ticker: (qty, price_entered) }
+    """
+    if require_known_tickers:
+        secs = market.list_securities()
+        rows = [(s.ticker, s.name, f"{s.price:,.2f}") for s in secs]
+        ui.table("Marketplace", ["Ticker", "Name", "Price"], rows)
+
+    tickers = _parse_tickers(ui, require_known=require_known_tickers)
+
+    qty_map: Dict[str, float] = {}
+    for t in tickers:
+        qty_map[t] = _ask_float(ui, qty_label_tmpl.format(ticker=t))
+
+    price_map: Dict[str, float] = {}
+    for t in tickers:
+        price_map[t] = _ask_float(ui, price_label_tmpl.format(ticker=t))
+
+    orders: Dict[str, Tuple[float, float]] = {}
+    total = 0.0
+    for t in tickers:
+        q = qty_map[t]
+        p = price_map[t]
+        orders[t] = (q, p)
+        total += q * p
+
+    return orders, round(total, 2)
+def _collect_orders_guided_sell(
+    ui: ConsoleUI,
+    *,
+    require_known_tickers: bool,
+    qty_label_tmpl: str,
+    price_label_tmpl: str,
+) -> Tuple[Dict[str, Tuple[float, float]], float]:
+    """
+    SELL order entry (user-provided sale price):
+      1) optionally show marketplace
+      2) ask tickers (comma-separated)
+      3) ask qty per ticker
+      4) ask sale price per ticker
+    Returns: (orders_map, total_proceeds_preview)
+             where orders_map = { ticker: (qty, price_entered) }
+    """
+    if require_known_tickers:
+        secs = market.list_securities()
+        rows = [(s.ticker, s.name, f"{s.price:,.2f}") for s in secs]
+        ui.table("Marketplace", ["Ticker", "Name", "Price"], rows)
+
+    tickers = _parse_tickers(ui, require_known=require_known_tickers)
+
+    qty_map: Dict[str, float] = {}
+    for t in tickers:
+        qty_map[t] = _ask_float(ui, qty_label_tmpl.format(ticker=t))
+
+    price_map: Dict[str, float] = {}
+    for t in tickers:
+        price_map[t] = _ask_float(ui, price_label_tmpl.format(ticker=t))
+
+    orders: Dict[str, Tuple[float, float]] = {}
+    total = 0.0
+    for t in tickers:
+        q = qty_map[t]
+        p = price_map[t]
+        orders[t] = (q, p)
+        total += q * p
+
+    return orders, round(total, 2)
+def _collect_orders_guided_sell(
+    ui: ConsoleUI,
+    *,
+    require_known_tickers: bool,
+    qty_label_tmpl: str,
+    price_label_tmpl: str,
+) -> Tuple[Dict[str, Tuple[float, float]], float]:
+    """
+    SELL order entry (user-provided price):
+      - optionally show marketplace
+      - ask tickers (comma-separated)
+      - ask qty per ticker
+      - ask sale price per ticker (USER INPUT)
+    Returns: (orders_map, total_proceeds_preview)
+             where orders_map = { ticker: (qty, user_price) }
+    """
+    if require_known_tickers:
+        secs = market.list_securities()
+        rows = [(s.ticker, s.name, f"{s.price:,.2f}") for s in secs]
+        ui.table("Marketplace", ["Ticker", "Name", "Price"], rows)
+
+    tickers = _parse_tickers(ui, require_known=require_known_tickers)
+
+    qty_map: Dict[str, float] = {}
+    for t in tickers:
+        qty_map[t] = _ask_float(ui, qty_label_tmpl.format(ticker=t))
+
+    price_map: Dict[str, float] = {}
+    for t in tickers:
+        price_map[t] = _ask_float(ui, price_label_tmpl.format(ticker=t))
+
+    orders: Dict[str, Tuple[float, float]] = {}
+    total = 0.0
+    for t in tickers:
+        q = qty_map[t]
+        p = price_map[t]        # <-- user-provided sale price
+        orders[t] = (q, p)
+        total += q * p
+
+    return orders, round(total, 2)
+

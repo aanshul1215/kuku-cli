@@ -23,3 +23,10 @@ class Portfolio:
     strategy: str
     # holdings: ticker -> quantity
     holdings: Dict[str, float] = field(default_factory=dict)
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Security:
+    ticker: str
+    name: str
+    price: float
